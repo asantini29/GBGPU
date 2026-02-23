@@ -86,26 +86,61 @@ endfunction()
 # * * Definition of compiled backends * *
 # * * * * * * * * * * * * * * * * * * * *
 
+# ====================================================
+# ==== Discover local lisatools & gpubackendtools ====
+# ====================================================
+
+# Discover gpubackendtools cutils directory (provides gbt_global.h)
+execute_process(
+  COMMAND "${Python_EXECUTABLE}" -c "if True:
+    import gpubackendtools
+    print(gpubackendtools.__file__.split('__init__.py')[0] + 'cutils')"
+  OUTPUT_VARIABLE GBT_CUTILS
+  OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+if(EXISTS "${GBT_CUTILS}/gbt_global.h")
+  message(STATUS "Found gbt_global.h in: ${GBT_CUTILS}")
+else()
+  message(FATAL_ERROR "Could not find gbt_global.h in gpubackendtools. "
+    "Make sure gpubackendtools is installed.")
+endif()
+
+# Discover lisatools directory (provides Detector.cu, Detector.hpp)
+execute_process(
+  COMMAND "${Python_EXECUTABLE}" -c "if True:
+    import lisatools
+    _tmp = lisatools.__file__
+    print(_tmp.split('/__init__.py')[0])"
+  OUTPUT_VARIABLE LISATOOLS_DIR
+  OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+message(STATUS "LISATOOLS location is ${LISATOOLS_DIR}.")
+
+if(NOT EXISTS "${LISATOOLS_DIR}/cutils/Detector.cu")
+  message(FATAL_ERROR "${LISATOOLS_DIR}/cutils/Detector.cu does not exist. "
+    "Make sure lisatools (LISAanalysistools) is installed.")
+endif()
+
+if(NOT EXISTS "${LISATOOLS_DIR}/cutils/Detector.hpp")
+  message(FATAL_ERROR "${LISATOOLS_DIR}/cutils/Detector.hpp does not exist. "
+    "Make sure lisatools (LISAanalysistools) is installed.")
+endif()
+
+file(GLOB LISATOOLS_CUTILS_FILES "${LISATOOLS_DIR}/cutils/*")
+message(STATUS "LISATOOLS cutils files: ${LISATOOLS_CUTILS_FILES}")
+
+# Check for optional PSD support from lisatools
+if(EXISTS "${LISATOOLS_DIR}/cutils/PSD.cu")
+  set(LISATOOLS_HAS_PSD TRUE)
+  message(STATUS "PSD.cu found in lisatools - will include PSD support")
+else()
+  set(LISATOOLS_HAS_PSD FALSE)
+  message(STATUS "PSD.cu not found in lisatools - building without PSD support")
+endif()
+
 # ----------------
 # --- utils ---
 # ----------------
-
-# 0. Download lisa analysis tools c files.
-file(
-  DOWNLOAD 
-  https://raw.githubusercontent.com/mikekatz04/LISAanalysistools/refs/heads/main/src/lisatools/cutils/Detector.cu 
-  "./src/gbgpu/cutils/Detector.cu"
-)
-file(
-  DOWNLOAD 
-  https://raw.githubusercontent.com/mikekatz04/LISAanalysistools/refs/heads/main/src/lisatools/cutils/Detector.hpp 
-  "./src/gbgpu/cutils/Detector.hpp"
-)
-file(
-  DOWNLOAD 
-  https://raw.githubusercontent.com/mikekatz04/LISAanalysistools/refs/heads/main/src/lisatools/cutils/global.hpp 
-  "./src/gbgpu/cutils/global.hpp"
-)
 # I. Process gbgpu_utils_wrap.pyx into a C++ file
 add_custom_command(
   OUTPUT "utils.cxx"
@@ -140,9 +175,9 @@ if(GBGPU_WITH_CPU)
   add_custom_command(
     OUTPUT "Detector.cxx"
     COMMENT "Copy Detector.cu to Detector.cxx"
-    COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/Detector.cu"
+    COMMAND ${CMAKE_COMMAND} -E copy "${LISATOOLS_DIR}/cutils/Detector.cu"
             "${CMAKE_CURRENT_BINARY_DIR}/Detector.cxx"
-    DEPENDS "Detector.cu"
+    DEPENDS "${LISATOOLS_DIR}/cutils/Detector.cu"
     VERBATIM)
 
   add_custom_command(
@@ -153,18 +188,40 @@ if(GBGPU_WITH_CPU)
     DEPENDS "SharedMemoryGBGPU.cu"
     VERBATIM)
 
+  if(LISATOOLS_HAS_PSD)
+    add_custom_command(
+      OUTPUT "PSD.cxx"
+      COMMENT "Copy PSD.cu to PSD.cxx"
+      COMMAND ${CMAKE_COMMAND} -E copy "${LISATOOLS_DIR}/cutils/PSD.cu"
+              "${CMAKE_CURRENT_BINARY_DIR}/PSD.cxx"
+      DEPENDS "${LISATOOLS_DIR}/cutils/PSD.cu"
+      VERBATIM)
+  endif()
 
-  python_add_library(gbgpu_cpu_utils MODULE WITH_SOABI Detector.cxx utils.cxx gbgpu_utils.cxx)
+  # Build CPU source lists - PSD.cxx is optional
+  set(CPU_UTILS_SOURCES Detector.cxx utils.cxx gbgpu_utils.cxx)
+  if(LISATOOLS_HAS_PSD)
+    list(APPEND CPU_UTILS_SOURCES PSD.cxx)
+  endif()
+
+  set(CPU_SHAREDMEM_SOURCES Detector.cxx SharedMemoryGBGPU.cxx sharedmemgbgpu.cxx)
+  if(LISATOOLS_HAS_PSD)
+    list(APPEND CPU_SHAREDMEM_SOURCES PSD.cxx)
+  endif()
+
+  python_add_library(gbgpu_cpu_utils MODULE WITH_SOABI ${CPU_UTILS_SOURCES})
   apply_cpu_backend_common_options(utils)
+  target_include_directories(gbgpu_cpu_utils PRIVATE ${GBT_CUTILS} "${LISATOOLS_DIR}/cutils/")
 
   target_sources(gbgpu_cpu_utils PUBLIC FILE_SET HEADERS FILES
-  global.hpp Detector.hpp cuda_complex.hpp global.h gbgpu_utils.hh)
+  cuda_complex.hpp global.h gbgpu_utils.hh)
 
   
-  python_add_library(gbgpu_cpu_sharedmem MODULE WITH_SOABI Detector.cxx SharedMemoryGBGPU.cxx sharedmemgbgpu.cxx)
+  python_add_library(gbgpu_cpu_sharedmem MODULE WITH_SOABI ${CPU_SHAREDMEM_SOURCES})
   apply_cpu_backend_common_options(sharedmem)
+  target_include_directories(gbgpu_cpu_sharedmem PRIVATE ${GBT_CUTILS} "${LISATOOLS_DIR}/cutils/")
   target_sources(gbgpu_cpu_sharedmem PUBLIC FILE_SET HEADERS FILES
-  global.hpp Detector.hpp cuda_complex.hpp global.h SharedMemoryGBGPU.hpp
+  cuda_complex.hpp global.h SharedMemoryGBGPU.hpp
   common.hpp fp16_common.hpp common.hpp)
   install(TARGETS gbgpu_cpu_sharedmem gbgpu_cpu_utils
           LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/python${PYTHON_VERSION_MAJOR}.${PYTHON_VERSION_MINOR}/site-packages/gbgpu)
@@ -175,16 +232,27 @@ endif()
 
 # III. Declare the GPU backend
 if(GBGPU_WITH_GPU)
-  python_add_library(gbgpu_gpu_utils MODULE WITH_SOABI utils.cxx gbgpu_utils.cu)
+  # Build GPU source lists - PSD.cu is optional
+  set(GPU_UTILS_SOURCES utils.cxx gbgpu_utils.cu)
+  if(LISATOOLS_HAS_PSD)
+    list(APPEND GPU_UTILS_SOURCES "${LISATOOLS_DIR}/cutils/PSD.cu")
+  endif()
+
+  set(GPU_SHAREDMEM_SOURCES "${LISATOOLS_DIR}/cutils/Detector.cu" SharedMemoryGBGPU.cu sharedmemgbgpu.cxx)
+  if(LISATOOLS_HAS_PSD)
+    list(APPEND GPU_SHAREDMEM_SOURCES "${LISATOOLS_DIR}/cutils/PSD.cu")
+  endif()
+
+  python_add_library(gbgpu_gpu_utils MODULE WITH_SOABI ${GPU_UTILS_SOURCES})
   apply_gpu_backend_common_options(utils)
+  target_include_directories(gbgpu_gpu_utils PRIVATE ${GBT_CUTILS} "${LISATOOLS_DIR}/cutils/")
   target_sources(gbgpu_gpu_utils PUBLIC FILE_SET HEADERS FILES
                                          cuda_complex.hpp global.h gbgpu_utils.hh)
 
   
-  # Add an include directory for a specific target
-  # Find a library
-  python_add_library(gbgpu_gpu_sharedmem MODULE WITH_SOABI Detector.cu SharedMemoryGBGPU.cu sharedmemgbgpu.cxx)
+  python_add_library(gbgpu_gpu_sharedmem MODULE WITH_SOABI ${GPU_SHAREDMEM_SOURCES})
   apply_gpu_backend_common_options(sharedmem)
+  target_include_directories(gbgpu_gpu_sharedmem PRIVATE ${GBT_CUTILS} "${LISATOOLS_DIR}/cutils/")
   message(STATUS "CUDA ARCHS HERE: ${GBGPU_CUDA_ARCH}")
   set_property(TARGET gbgpu_gpu_sharedmem PROPERTY CUDA_ARCHITECTURES ${GBGPU_CUDA_ARCH})
   set_property(TARGET gbgpu_gpu_sharedmem PROPERTY CUDA_SEPARABLE_COMPILATION ON)
@@ -231,7 +299,7 @@ if(GBGPU_WITH_GPU)
   set(mathdx_DIR "${CMAKE_CURRENT_SOURCE_DIR}/nvidia-mathdx-25.06.1/nvidia/mathdx/25.06/lib/cmake/mathdx")
   find_package(mathdx REQUIRED COMPONENTS cufftdx CONFIG PATHS "${CMAKE_CURRENT_SOURCE_DIR}/nvidia-mathdx-25.06.1/nvidia/mathdx/25.06/")
   target_sources(gbgpu_gpu_sharedmem PUBLIC FILE_SET HEADERS FILES
-  global.hpp Detector.hpp cuda_complex.hpp global.h SharedMemoryGBGPU.hpp
+  cuda_complex.hpp global.h SharedMemoryGBGPU.hpp
   common.hpp fp16_common.hpp common.hpp)
   target_link_libraries(gbgpu_gpu_sharedmem PUBLIC CUDA::cudart CUDA::cublas
       CUDA::cusparse mathdx::cufftdx)
@@ -352,5 +420,3 @@ endif()
 
 #   # Installation options
 #   install(TARGETS "${module_name}" DESTINATION ${backend_name})
-
-
